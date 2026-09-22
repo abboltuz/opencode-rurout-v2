@@ -5,8 +5,8 @@ import {
   PROVIDER_PACKAGE,
 } from "./constants.js";
 import { fetchGatewayModels } from "./discovery.js";
-import { keyFingerprint, purgeLegacyFileCache } from "./cache.js";
-import { canonicalId, displayName, familyOf, isImage, isReasoning, lookup, modelLabel } from "./fallback.js";
+import { purgeLegacyFileCache } from "./cache.js";
+import { displayName, familyOf, isImage, isReasoning, lookup } from "./fallback.js";
 
 interface RuroutOptions {
   baseURL?: string;
@@ -97,20 +97,6 @@ function toModel(canonical: string, apiId: string, display: string | undefined, 
   };
 }
 
-function pickApiId(ids: string[]): string {
-  const rank = (id: string): number => {
-    if (/-tiered$/i.test(id)) return 0;
-    if (/-medium$/i.test(id)) return 1;
-    if (/-high$/i.test(id)) return 2;
-    if (/-low$/i.test(id)) return 3;
-    if (/-thinking$/i.test(id)) return 4;
-    if (/-preview$/i.test(id)) return 5;
-    if (/-\d{8}$/.test(id)) return 6;
-    return 7;
-  };
-  return [...ids].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0))[0]!;
-}
-
 async function fetchKeyLabel(baseURL: string, apiKey: string): Promise<string> {
   try {
     const response = await fetch(`${baseURL.replace(/\/$/, "")}/sub2api/billing`, {
@@ -141,63 +127,30 @@ function sanitizeLabel(raw: string): string {
     .join(" ");
 }
 
-const REFRESH_INTERVAL_MS = 15_000;
-const KEY_REFRESH_DEBOUNCE_MS = 60_000;
-const seenKeyFingerprints = new Set<string>();
-const lastKeyRefreshAt = new Map<string, number>();
+const KEY_WATCH_INTERVAL_MS = 15_000;
+const MODEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
-function shouldRefreshForKey(apiKey: string): boolean {
-  const fingerprint = keyFingerprint(apiKey);
-  if (!seenKeyFingerprints.has(fingerprint)) {
-    seenKeyFingerprints.add(fingerprint);
-    lastKeyRefreshAt.set(fingerprint, Date.now());
-    return true;
-  }
-  const last = lastKeyRefreshAt.get(fingerprint) ?? 0;
-  if (Date.now() - last < KEY_REFRESH_DEBOUNCE_MS) return false;
-  lastKeyRefreshAt.set(fingerprint, Date.now());
-  return true;
-}
-
-async function refreshModelsForKey(
+async function applyModels(
   ctx: PluginContext,
   baseURL: string,
   apiKey: string,
-): Promise<number> {
-  if (!apiKey || !shouldRefreshForKey(apiKey)) return 0;
-  await purgeLegacyFileCache();
-  const count = await applyModels(ctx, baseURL, apiKey).catch(() => 0);
-  if (count > 0) {
-    await ctx.catalog.reload().catch(() => undefined);
-  }
-  return count;
-}
-
-async function applyModels(ctx: PluginContext, baseURL: string, apiKey: string): Promise<number> {
-  let live;
-  try {
-    live = await fetchGatewayModels(baseURL, apiKey);
-  } catch {
-    return 0;
-  }
-  const groups = new Map<string, { ids: string[]; display?: string }>();
-  for (const m of live) {
-    const canonical = canonicalId(m.id);
-    const entry = groups.get(canonical) ?? { ids: [] };
-    entry.ids.push(m.id);
-    if (!entry.display && m.display_name && m.display_name !== m.id) entry.display = m.display_name;
-    groups.set(canonical, entry);
-  }
-  const models = [...groups.entries()].map(([canonical, entry]) => {
-    const apiId = pickApiId(entry.ids);
-    const model = toModel(canonical, apiId, entry.display, PROVIDER_ID);
-    model.display = entry.display ?? apiId;
-    return model;
+  isCurrent: () => boolean,
+): Promise<boolean> {
+  const live = await fetchGatewayModels(baseURL, apiKey);
+  if (!isCurrent()) return false;
+  // Keep every exact gateway ID. A model must always be requested with the ID
+  // that the key's /models endpoint granted, rather than an alias from another key.
+  const models = [...new Map(live.map((model) => [model.id, model])).values()].map((model) => {
+    const result = toModel(model.id, model.id, model.display_name, PROVIDER_ID);
+    result.display = model.display_name ?? model.id;
+    return result;
   });
   const keyLabel = sanitizeLabel(await fetchKeyLabel(baseURL, apiKey));
+  if (!isCurrent()) return false;
   const providerName = keyLabel ? `RuRout ${keyLabel}` : PROVIDER_NAME;
   const seen = new Set(models.map((m) => m.id));
   await ctx.catalog.transform((draft: AnyRecord) => {
+    if (!isCurrent()) return;
     draft.provider.update(PROVIDER_ID, (provider: AnyRecord) => {
       provider.name = providerName;
     });
@@ -228,7 +181,7 @@ async function applyModels(ctx: PluginContext, baseURL: string, apiKey: string):
       });
     }
   });
-  return models.length;
+  return true;
 }
 
 const plugin: PluginDef = {
@@ -261,25 +214,48 @@ const plugin: PluginDef = {
 
     await purgeLegacyFileCache();
 
-    const apiKey = await resolveApiKey(ctx);
-    if (apiKey) {
-      await refreshModelsForKey(ctx, baseURL, apiKey);
-    }
+    let lastKey = await resolveApiKey(ctx);
+    let refreshVersion = 0;
+    const refresh = async (key: string, clearFirst: boolean) => {
+      const version = ++refreshVersion;
+      if (clearFirst) {
+        // Do not leave models from the previous key selectable while discovery runs.
+        await ctx.catalog.transform((draft: AnyRecord) => {
+          const rec = draft.provider.list().find((r: AnyRecord) => r.provider?.id === PROVIDER_ID);
+          const stored = rec?.models;
+          const ids = stored instanceof Map ? [...stored.keys()] : Object.keys(stored ?? {});
+          for (const id of ids) draft.model.remove(PROVIDER_ID, id);
+        });
+        await ctx.catalog.reload().catch(() => undefined);
+      }
+      if (!key) return;
+      await purgeLegacyFileCache();
+      try {
+        const applied = await applyModels(ctx, baseURL, key, () => version === refreshVersion && key === lastKey);
+        if (applied) await ctx.catalog.reload().catch(() => undefined);
+      } catch {
+        // Keep the last successful list for periodic refreshes. A changed key was
+        // cleared above, so unavailable models are never carried to the new key.
+      }
+    };
+    if (lastKey) await refresh(lastKey, false);
 
-    let lastKey = apiKey;
-    const refreshTimer = setInterval(() => {
+    const keyWatchTimer = setInterval(() => {
       void (async () => {
         const key = await resolveApiKey(ctx);
-        if (!key) return;
         if (key !== lastKey) {
           lastKey = key;
-          await refreshModelsForKey(ctx, baseURL, key);
-          return;
+          await refresh(key, true);
         }
       })();
-    }, REFRESH_INTERVAL_MS);
-    if (typeof (refreshTimer as unknown as { unref?: () => void }).unref === "function") {
-      (refreshTimer as unknown as { unref: () => void }).unref();
+    }, KEY_WATCH_INTERVAL_MS);
+    const hourlyRefreshTimer = setInterval(() => {
+      void refresh(lastKey, false);
+    }, MODEL_REFRESH_INTERVAL_MS);
+    for (const timer of [keyWatchTimer, hourlyRefreshTimer]) {
+      if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+        (timer as unknown as { unref: () => void }).unref();
+      }
     }
 
     await ctx.aisdk.hook("sdk", async (event: AnyRecord) => {
@@ -287,14 +263,16 @@ const plugin: PluginDef = {
       const key = await resolveApiKey(ctx);
       if (!key) return;
       event.options = { ...(event.options ?? {}), apiKey: key, baseURL };
-      if (key !== lastKey) {
+      const changed = key !== lastKey;
+      if (changed) {
         lastKey = key;
       }
-      await refreshModelsForKey(ctx, baseURL, key);
+      await refresh(key, changed);
     });
 
     return () => {
-      clearInterval(refreshTimer);
+      clearInterval(keyWatchTimer);
+      clearInterval(hourlyRefreshTimer);
     };
   },
 };
