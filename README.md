@@ -1,6 +1,6 @@
 # @rurout/opencode-v2
 
-OpenCode **2.x** provider plugin for [RuRout](https://rurout.online) — your gateway key becomes a first-class provider in `/models`.
+OpenCode **2.x** provider plugin for [RuRout](https://rurout.ru) — your gateway key becomes a first-class provider in `/models`.
 
 > For OpenCode **1.x**, use [@rurout/opencode-v1](https://www.npmjs.com/package/@rurout/opencode-v1) instead
 > ([source](https://github.com/abboltuz/opencode-rurout-v1)).
@@ -41,7 +41,7 @@ opencode
   "plugins": [
     {
       "package": "@rurout/opencode-v2@latest",
-      "options": { "baseURL": "https://your-gateway.example.com:9443/v1" }
+      "options": { "baseURL": "https://rurout.ru/v1" }
     }
   ]
 }
